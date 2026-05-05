@@ -6,8 +6,9 @@ This repository contains SurgSora, an object-aware diffusion system for controll
 
 ## Build, Test, and Development Commands
 
-- `pip install -r requirements.txt`: install project dependencies.
-- `git clone https://github.com/facebookresearch/sam2.git && cd sam2 && pip install -e .`: install SAM2 outside this repo.
+- `uv sync`: create or update the Python 3.11 project environment from `pyproject.toml` and `uv.lock`.
+- `source .venv/bin/activate`: activate the synced local environment before running scripts.
+- `git clone https://github.com/facebookresearch/sam2.git && cd sam2 && uv pip install -e .`: install SAM2 outside this repo.
 - `python gradio_demo_run.py`: launch the local Gradio demo from the repository root after checkpoints are available.
 - `cd Training && bash train_stage1.sh`: run stage 1 training; confirm checkpoint paths match your layout.
 - `cd Training && bash train_stage2.sh`: run stage 2 training after the stage 1 ControlNet checkpoint exists.

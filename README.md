@@ -30,13 +30,28 @@
 
 ## Environment Setup
 
-`pip install -r requirements.txt`
+Use Python 3.11 with `uv`:
+
+```
+uv sync
+source .venv/bin/activate
+```
+
+This installs the dependencies pinned in `pyproject.toml`, including
+`torch==2.11.0` and `torchvision==0.26.0`. For LPIPS evaluation, install the
+optional metric dependency:
+
+```
+uv sync --extra metrics
+```
+
+Legacy pip setup is still available with `pip install -r requirements.txt`.
 
 Install [SAM2](https://github.com/facebookresearch/sam2) follow this:
 ```
 git clone https://github.com/facebookresearch/sam2.git && cd sam2
 
-pip install -e .
+uv pip install -e .
 ```
 
 ## Training
