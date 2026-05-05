@@ -91,6 +91,9 @@ python Training/eval_surgwmbench_20anchor.py \
 The model input excludes future anchor coordinates; `sampled_indices` are used
 only to select the 20 human-anchor frames from each dense clip.
 
+See [USAGE.md](USAGE.md) for `uv sync`, single-GPU, and multi-GPU training
+commands.
+
 
 ## Download checkpoints
 
