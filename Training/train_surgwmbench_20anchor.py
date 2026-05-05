@@ -113,7 +113,8 @@ def _prepare_models(args, accelerator: Accelerator, weight_dtype: torch.dtype):
     vae.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
-    controlnet.to(accelerator.device, dtype=weight_dtype)
+    unet.conv_in.to(dtype=torch.float32)
+    controlnet.to(accelerator.device, dtype=torch.float32)
     return feature_extractor, image_encoder, vae, unet, controlnet
 
 

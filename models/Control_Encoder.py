@@ -619,8 +619,23 @@ class DualFlowControlNet(ControlNetSDVModel):
         conditioning_channels: int = 3,
         conditioning_embedding_out_channels : Optional[Tuple[int, ...]] = (16, 32, 96, 256),
     ):
-        super().__init__()
-
+        super().__init__(
+            sample_size=sample_size,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            down_block_types=down_block_types,
+            up_block_types=up_block_types,
+            block_out_channels=block_out_channels,
+            addition_time_embed_dim=addition_time_embed_dim,
+            projection_class_embeddings_input_dim=projection_class_embeddings_input_dim,
+            layers_per_block=layers_per_block,
+            cross_attention_dim=cross_attention_dim,
+            transformer_layers_per_block=transformer_layers_per_block,
+            num_attention_heads=num_attention_heads,
+            num_frames=num_frames,
+            conditioning_channels=conditioning_channels,
+            conditioning_embedding_out_channels=conditioning_embedding_out_channels,
+        )
 
         self.cond_flow_encoder = CondFeatureEncoder()
         self.depth_flow_encoder = DepthFeatureEncoder()

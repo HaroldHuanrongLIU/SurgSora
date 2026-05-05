@@ -31,7 +31,7 @@ def decode_latents_to_frames(latents: torch.Tensor, vae, decode_chunk_size: int 
 
 
 def encode_context_images(context_frames: torch.Tensor, feature_extractor, image_encoder, dtype: torch.dtype) -> torch.Tensor:
-    """Encode all context frames as CLIP tokens with shape [B, context_frames, D]."""
+    """Encode context frames as a single mean-pooled CLIP token with shape [B, 1, D]."""
     batch_size, context_count = context_frames.shape[:2]
     flat = rearrange(context_frames, "b f c h w -> (b f) c h w")
     flat = flat * 2.0 - 1.0
@@ -47,7 +47,7 @@ def encode_context_images(context_frames: torch.Tensor, feature_extractor, image
     ).pixel_values
     pixel_values = pixel_values.to(device=context_frames.device, dtype=dtype)
     embeds = image_encoder(pixel_values).image_embeds
-    return embeds.view(batch_size, context_count, -1)
+    return embeds.view(batch_size, context_count, -1).mean(dim=1, keepdim=True)
 
 
 def build_5frame_latent_input(
