@@ -630,13 +630,14 @@ class DualFlowControlNet(ControlNetSDVModel):
             conditioning_channels=conditioning_channels,
         )
 
+        flow_frame_count = num_frames - 1
         self.control_fusion_block = nn.ModuleList([
             nn.Sequential(
-                nn.Conv3d(20,20, \
+                nn.Conv3d(flow_frame_count, flow_frame_count, \
                           kernel_size=(1, 1, 1), stride=(1, 1, 1),\
                               padding=(0, 0, 0)),
 
-                nn.Conv3d(20,20, \
+                nn.Conv3d(flow_frame_count, flow_frame_count, \
                           kernel_size=(2, 1, 1), stride=(2, 1, 1),\
                               padding=(0, 0, 0)),
 
@@ -806,4 +807,3 @@ class DualFlowControlNet(ControlNetSDVModel):
         return FlowControlNetOutput(
             down_block_res_samples=down_block_res_samples, mid_block_res_sample=mid_block_res_sample, controlnet_flow=controlnet_flow, cmp_output=None
         )
-

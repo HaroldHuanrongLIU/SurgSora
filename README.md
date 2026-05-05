@@ -49,6 +49,33 @@ stage 2
 bash train_stage2.sh
 ```
 
+## SurgWMBench 20-Anchor Training
+
+The SurgWMBench adaptation uses the official manifests under
+`/mnt/hdd1/neurips2026_dataset_track/SurgWMBench`. Each sample loads the 20
+human-labeled anchor frames, conditions on anchors 1-5, and trains one model to
+predict anchors 6-20. Metrics are reported by slicing the same 15-frame output
+into 5, 10, and 15 frame horizons.
+
+Train a small smoke run:
+```
+python Training/train_surgwmbench_20anchor.py \
+  --pretrained-model-name-or-path ./Training/ckpts/stable-video-diffusion-img2vid-xt-1-1 \
+  --output-dir ./Training/logs/surgwmbench_20anchor \
+  --max-clips 1 --max-train-batches 1 --num-train-epochs 1
+```
+
+Evaluate at original frame resolution:
+```
+python Training/eval_surgwmbench_20anchor.py \
+  --pretrained-model-name-or-path ./Training/ckpts/stable-video-diffusion-img2vid-xt-1-1 \
+  --checkpoint-dir ./Training/logs/surgwmbench_20anchor \
+  --manifest manifests/val.jsonl --max-clips 1
+```
+
+The model input excludes future anchor coordinates; `sampled_indices` are used
+only to select the 20 human-anchor frames from each dense clip.
+
 
 ## Download checkpoints
 
