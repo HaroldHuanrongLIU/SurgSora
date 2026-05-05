@@ -2,8 +2,10 @@
 
 This guide documents the Python command path for the SurgWMBench 20-anchor
 adaptation. It trains one SurgSora checkpoint with 5 context anchors and 15
-future anchors, then evaluates horizons 5, 10, and 15 against original-size
-frames.
+future anchors. The model input is the first 5 anchor frames plus their 5
+observed trajectory points, and the output is the future 15 anchor frames plus
+the future 15 trajectory points. Evaluation reports horizons 5, 10, and 15
+against original-size frames and original-resolution trajectory pixels.
 
 ## Environment
 
@@ -43,6 +45,15 @@ The default pretrained checkpoint path is:
 
 ```text
 ./Training/ckpts/stable-video-diffusion-img2vid-xt-1-1
+```
+
+Training writes a joint checkpoint with:
+
+```text
+unet_context/
+controlnet/
+trajectory_head.pt
+training_args.json
 ```
 
 ## Single-GPU Training
@@ -91,7 +102,7 @@ per-gpu-batch-size * num_processes * gradient-accumulation-steps
 ## Evaluation
 
 Evaluate one checkpoint and report original-resolution metrics for horizons
-5, 10, and 15:
+5, 10, and 15. The report includes image metrics and trajectory ADE/FDE:
 
 ```bash
 uv run --frozen python Training/eval_surgwmbench_20anchor.py \

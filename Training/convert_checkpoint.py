@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from Training.surgwmbench_modeling import expand_conv_in_channels, resize_dual_control_fusion
+from Training.trajectory_head import TrajectoryPredictionHead, save_trajectory_head
 from models.Control_Backbone import UNetControlNetModel
 from models.Control_Encoder import DualFlowControlNet
 
@@ -25,6 +26,10 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--context-frames", type=int, default=5)
     parser.add_argument("--target-frames", type=int, default=15)
+    parser.add_argument("--image-embed-dim", type=int, default=1024)
+    parser.add_argument("--trajectory-hidden-dim", type=int, default=512)
+    parser.add_argument("--trajectory-num-layers", type=int, default=2)
+    parser.add_argument("--trajectory-num-heads", type=int, default=8)
     args = parser.parse_args()
 
     ckpt = Path(args.checkpoint_dir)
@@ -48,7 +53,21 @@ def main():
 
     unet.save_pretrained(out / "unet_context")
     controlnet.save_pretrained(out / "controlnet")
-    print(f"Wrote {out / 'unet_context'} and {out / 'controlnet'}")
+    trajectory_state_path = ckpt / "model_2.safetensors"
+    if trajectory_state_path.exists():
+        trajectory_head = TrajectoryPredictionHead(
+            image_embed_dim=args.image_embed_dim,
+            hidden_dim=args.trajectory_hidden_dim,
+            context_frames=args.context_frames,
+            target_frames=args.target_frames,
+            num_layers=args.trajectory_num_layers,
+            num_heads=args.trajectory_num_heads,
+        )
+        trajectory_head.load_state_dict(load_file(trajectory_state_path))
+        save_trajectory_head(trajectory_head, out / "trajectory_head.pt")
+        print(f"Wrote {out / 'unet_context'}, {out / 'controlnet'}, and {out / 'trajectory_head.pt'}")
+    else:
+        print(f"Wrote {out / 'unet_context'} and {out / 'controlnet'}; no model_2.safetensors trajectory head found")
 
 
 if __name__ == "__main__":

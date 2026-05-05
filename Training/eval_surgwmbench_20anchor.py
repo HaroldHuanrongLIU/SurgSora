@@ -28,6 +28,7 @@ from Training.surgwmbench_modeling import (
     tensor_to_vae_latent,
 )
 from Training.train_utils.surgwmbench_dataset import SurgWMBench20AnchorDataset, surgwmbench_collate
+from Training.trajectory_head import load_trajectory_head, normalized_to_pixel_coords, trajectory_ade_fde
 
 
 def parse_args():
@@ -88,6 +89,10 @@ def _load_models(args, device: torch.device, dtype: torch.dtype):
         raise FileNotFoundError(f"Missing trained controlnet directory: {controlnet_dir}")
     controlnet = DualFlowControlNet.from_pretrained(controlnet_dir)
     resize_dual_control_fusion(controlnet, args.target_frames - 1)
+    trajectory_path = checkpoint_dir / "trajectory_head.pt"
+    if not trajectory_path.exists():
+        raise FileNotFoundError(f"Missing trained trajectory head: {trajectory_path}")
+    trajectory_head = load_trajectory_head(trajectory_path, map_location="cpu")
 
     scheduler = EulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
@@ -95,7 +100,10 @@ def _load_models(args, device: torch.device, dtype: torch.dtype):
         module.requires_grad_(False)
         module.to(device=device, dtype=dtype)
         module.eval()
-    return feature_extractor, image_encoder, vae, unet, controlnet, scheduler
+    trajectory_head.requires_grad_(False)
+    trajectory_head.to(device=device, dtype=torch.float32)
+    trajectory_head.eval()
+    return feature_extractor, image_encoder, vae, unet, controlnet, trajectory_head, scheduler
 
 
 def _make_loader(args):
@@ -117,13 +125,17 @@ def _make_loader(args):
 
 
 @torch.no_grad()
-def _predict_batch(args, batch, models, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    feature_extractor, image_encoder, vae, unet, controlnet, scheduler = models
+def _predict_batch(args, batch, models, device: torch.device, dtype: torch.dtype):
+    feature_extractor, image_encoder, vae, unet, controlnet, trajectory_head, scheduler = models
     context_frames = batch["context_frames"].to(device=device, dtype=dtype)
+    context_coords_norm = batch["anchor_coords_norm"][:, : args.context_frames].to(device=device, dtype=torch.float32)
     batch_size = context_frames.shape[0]
 
     context_latents = tensor_to_vae_latent(context_frames, vae, sample=False)
-    encoder_hidden_states = encode_context_images(context_frames, feature_extractor, image_encoder, dtype)
+    image_tokens = encode_context_images(context_frames, feature_extractor, image_encoder, dtype)
+    trajectory_outputs = trajectory_head(image_tokens, context_coords_norm)
+    encoder_hidden_states = trajectory_outputs["encoder_hidden_states"].to(dtype=dtype)
+    pred_coords_norm = trajectory_outputs["pred_coords_norm"].clamp(0.0, 1.0)
     latent_height, latent_width = context_latents.shape[-2:]
 
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -175,7 +187,8 @@ def _predict_batch(args, batch, models, device: torch.device, dtype: torch.dtype
         ).sample
         latents = scheduler.step(noise_pred, timestep, latents).prev_sample
 
-    return decode_latents_to_frames(latents, vae, decode_chunk_size=args.decode_chunk_size)
+    frames = decode_latents_to_frames(latents, vae, decode_chunk_size=args.decode_chunk_size)
+    return frames, pred_coords_norm
 
 
 def _ssim(gt: np.ndarray, pred: np.ndarray) -> Optional[float]:
@@ -242,6 +255,15 @@ def _mean(values: List[Optional[float]]) -> Optional[float]:
     return float(sum(clean) / len(clean))
 
 
+def _trajectory_metrics(pred_coords: torch.Tensor, target_coords: torch.Tensor) -> Dict[str, float]:
+    ade, fde = trajectory_ade_fde(pred_coords.float(), target_coords.float())
+    return {"ade": float(ade.item()), "fde": float(fde.item())}
+
+
+def _coords_to_list(coords: torch.Tensor) -> List[List[float]]:
+    return [[float(x), float(y)] for x, y in coords.detach().cpu().tolist()]
+
+
 def main():
     args = parse_args()
     if args.context_frames != 5 or args.target_frames != 15:
@@ -259,14 +281,25 @@ def main():
     dataloader = _make_loader(args)
 
     horizons = {5: [], 10: [], 15: []}
+    trajectory_horizons_px = {5: [], 10: [], 15: []}
+    trajectory_horizons_norm = {5: [], 10: [], 15: []}
     sample_artifacts = []
+    prediction_rows = []
     clip_count = 0
 
     for batch in dataloader:
-        predictions = _predict_batch(args, batch, models, device, dtype)
+        predictions, pred_coords_norm = _predict_batch(args, batch, models, device, dtype)
         batch_size = predictions.shape[0]
         for batch_idx in range(batch_size):
             original_size = batch["original_size"][batch_idx]
+            target_coords_norm = batch["anchor_coords_norm"][
+                batch_idx, args.context_frames : args.context_frames + args.target_frames
+            ].float()
+            target_coords_px = batch["anchor_coords_px"][
+                batch_idx, args.context_frames : args.context_frames + args.target_frames
+            ].float()
+            pred_coords_norm_sample = pred_coords_norm[batch_idx].detach().cpu().float()
+            pred_coords_px = normalized_to_pixel_coords(pred_coords_norm_sample, tuple(original_size)).cpu()
             frame_metrics = []
             pred_frames_for_sample = []
             for frame_idx in range(args.target_frames):
@@ -281,12 +314,33 @@ def main():
             for horizon in horizons:
                 subset = frame_metrics[:horizon]
                 horizons[horizon].append({metric: _mean([item[metric] for item in subset]) for metric in subset[0]})
+                trajectory_horizons_px[horizon].append(
+                    _trajectory_metrics(pred_coords_px[:horizon], target_coords_px[:horizon])
+                )
+                trajectory_horizons_norm[horizon].append(
+                    _trajectory_metrics(pred_coords_norm_sample[:horizon], target_coords_norm[:horizon])
+                )
+
+            prediction_row = {
+                "patient_id": batch["patient_id"][batch_idx],
+                "source_video_id": batch["source_video_id"][batch_idx],
+                "trajectory_id": batch["trajectory_id"][batch_idx],
+                "original_size": list(original_size),
+                "pred_coords_norm": _coords_to_list(pred_coords_norm_sample),
+                "pred_coords_px": _coords_to_list(pred_coords_px),
+                "target_coords_norm": _coords_to_list(target_coords_norm),
+                "target_coords_px": _coords_to_list(target_coords_px),
+            }
+            prediction_rows.append(prediction_row)
 
             if clip_count < args.save_samples:
                 name = f"{batch['patient_id'][batch_idx]}_{batch['trajectory_id'][batch_idx]}"
                 gif_path = sample_dir / f"{clip_count:04d}_{name}.gif"
                 _save_gif(gif_path, pred_frames_for_sample, fps=7)
-                sample_artifacts.append(str(gif_path))
+                trajectory_path = sample_dir / f"{clip_count:04d}_{name}_trajectory.json"
+                with trajectory_path.open("w", encoding="utf-8") as handle:
+                    json.dump(prediction_row, handle, indent=2, sort_keys=True)
+                sample_artifacts.append({"gif": str(gif_path), "trajectory": str(trajectory_path)})
             clip_count += 1
 
     metrics = {}
@@ -295,21 +349,38 @@ def main():
             key: _mean([row[key] for row in rows])
             for key in ("mse", "mae", "psnr", "ssim", "lpips")
         }
+    trajectory_metrics_original_resolution = {}
+    trajectory_metrics_normalized = {}
+    for horizon, rows in trajectory_horizons_px.items():
+        trajectory_metrics_original_resolution[f"horizon_{horizon}"] = {
+            "ade_px": _mean([row["ade"] for row in rows]),
+            "fde_px": _mean([row["fde"] for row in rows]),
+        }
+    for horizon, rows in trajectory_horizons_norm.items():
+        trajectory_metrics_normalized[f"horizon_{horizon}"] = {
+            "ade_norm": _mean([row["ade"] for row in rows]),
+            "fde_norm": _mean([row["fde"] for row in rows]),
+        }
 
     report = {
         "dataset_name": "SurgWMBench",
-        "task": "20_anchor_first5_predict_6_to_20",
+        "task": "20_anchor_first5_predict_6_to_20_joint_image_trajectory",
         "manifest": args.manifest,
         "checkpoint_dir": args.checkpoint_dir,
         "context_frames": args.context_frames,
         "target_frames": args.target_frames,
         "metrics_original_resolution": metrics,
+        "trajectory_metrics_original_resolution": trajectory_metrics_original_resolution,
+        "trajectory_metrics_normalized": trajectory_metrics_normalized,
         "num_clips": clip_count,
         "sample_artifacts": sample_artifacts,
     }
+    with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
+        for row in prediction_rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2, sort_keys=True)
-    print(json.dumps(report["metrics_original_resolution"], indent=2, sort_keys=True))
+    print(json.dumps({"image": metrics, "trajectory": trajectory_metrics_original_resolution}, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -7,6 +7,13 @@ from torch import nn
 
 from Training.surgwmbench_modeling import expand_conv_in_channels, resize_dual_control_fusion
 from Training.train_utils.surgwmbench_dataset import SurgWMBench20AnchorDataset
+from Training.trajectory_head import (
+    TrajectoryPredictionHead,
+    load_trajectory_head,
+    normalized_to_pixel_coords,
+    save_trajectory_head,
+    trajectory_ade_fde,
+)
 
 
 DATASET_ROOT = Path("/mnt/hdd1/neurips2026_dataset_track/SurgWMBench")
@@ -25,6 +32,7 @@ def test_surgwmbench_20anchor_dataset_loads_one_clip():
     assert sample["context_frames"].shape == (5, 3, 64, 64)
     assert sample["target_frames"].shape == (15, 3, 64, 64)
     assert sample["anchor_coords_px"].shape == (20, 2)
+    assert sample["anchor_coords_norm"].shape == (20, 2)
     assert len(sample["sampled_indices"]) == 20
     assert sample["sampled_indices"][0] == 0
     assert sample["sampled_indices"][-1] == sample["num_frames"] - 1
@@ -81,3 +89,54 @@ def test_resize_dual_control_fusion_to_15_target_frames():
         assert block[1].in_channels == 14
         assert block[1].out_channels == 14
 
+
+def test_trajectory_prediction_head_shapes_and_range():
+    head = TrajectoryPredictionHead(
+        image_embed_dim=32,
+        hidden_dim=16,
+        context_frames=5,
+        target_frames=15,
+        num_layers=1,
+        num_heads=4,
+    )
+
+    outputs = head(torch.randn(2, 5, 32), torch.rand(2, 5, 2))
+
+    assert outputs["encoder_hidden_states"].shape == (2, 10, 32)
+    assert outputs["pred_coords_norm"].shape == (2, 15, 2)
+    assert torch.all(outputs["pred_coords_norm"] >= 0)
+    assert torch.all(outputs["pred_coords_norm"] <= 1)
+
+
+def test_trajectory_head_save_and_load_round_trip(tmp_path):
+    head = TrajectoryPredictionHead(
+        image_embed_dim=32,
+        hidden_dim=16,
+        context_frames=5,
+        target_frames=15,
+        num_layers=1,
+        num_heads=4,
+    )
+    path = tmp_path / "trajectory_head.pt"
+
+    save_trajectory_head(head, path)
+    loaded = load_trajectory_head(path, map_location="cpu")
+
+    assert loaded.config_dict() == head.config_dict()
+    for key, value in head.state_dict().items():
+        assert torch.equal(loaded.state_dict()[key], value)
+
+
+def test_trajectory_coordinate_helpers():
+    coords_norm = torch.tensor([[[0.5, 0.25], [1.0, 0.0]]])
+    coords_px = normalized_to_pixel_coords(coords_norm, (200, 100))
+    expected_px = torch.tensor([[[100.0, 25.0], [200.0, 0.0]]])
+
+    assert torch.allclose(coords_px, expected_px)
+
+    pred = torch.tensor([[[3.0, 4.0], [0.0, 10.0]]])
+    target = torch.zeros_like(pred)
+    ade, fde = trajectory_ade_fde(pred, target)
+
+    assert torch.isclose(ade, torch.tensor(7.5))
+    assert torch.isclose(fde, torch.tensor(10.0))
