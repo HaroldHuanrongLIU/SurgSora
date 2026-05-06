@@ -93,6 +93,9 @@ The model input excludes future anchor coordinates. `sampled_indices` are used
 only to select the 20 human-anchor frames from each dense clip, and future
 trajectory points are used only as training and evaluation labels.
 
+Pass `--prediction-task image-only` to train or evaluate the image-only variant
+without trajectory inputs, trajectory supervision, or `trajectory_head.pt`.
+
 See [USAGE.md](USAGE.md) for `uv sync`, single-GPU, and multi-GPU training
 commands.
 

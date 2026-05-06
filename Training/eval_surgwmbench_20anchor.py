@@ -53,7 +53,31 @@ def parse_args():
     parser.add_argument("--decode-chunk-size", type=int, default=8)
     parser.add_argument("--save-samples", type=int, default=4)
     parser.add_argument("--compute-lpips", action="store_true")
+    parser.add_argument(
+        "--prediction-task",
+        choices=["auto", "joint", "image-only"],
+        default="auto",
+        help="Evaluation mode. auto reads training_args.json or infers from trajectory_head.pt.",
+    )
     return parser.parse_args()
+
+
+def _resolve_prediction_task(args) -> str:
+    if args.prediction_task != "auto":
+        return args.prediction_task
+
+    checkpoint_dir = Path(args.checkpoint_dir)
+    training_args_path = checkpoint_dir / "training_args.json"
+    if training_args_path.exists():
+        with training_args_path.open("r", encoding="utf-8") as handle:
+            training_args = json.load(handle)
+        prediction_task = training_args.get("prediction_task")
+        if prediction_task in {"joint", "image-only"}:
+            return prediction_task
+
+    if (checkpoint_dir / "trajectory_head.pt").exists():
+        return "joint"
+    return "image-only"
 
 
 def _load_models(args, device: torch.device, dtype: torch.dtype):
@@ -89,10 +113,12 @@ def _load_models(args, device: torch.device, dtype: torch.dtype):
         raise FileNotFoundError(f"Missing trained controlnet directory: {controlnet_dir}")
     controlnet = DualFlowControlNet.from_pretrained(controlnet_dir)
     resize_dual_control_fusion(controlnet, args.target_frames - 1)
-    trajectory_path = checkpoint_dir / "trajectory_head.pt"
-    if not trajectory_path.exists():
-        raise FileNotFoundError(f"Missing trained trajectory head: {trajectory_path}")
-    trajectory_head = load_trajectory_head(trajectory_path, map_location="cpu")
+    trajectory_head = None
+    if args.prediction_task == "joint":
+        trajectory_path = checkpoint_dir / "trajectory_head.pt"
+        if not trajectory_path.exists():
+            raise FileNotFoundError(f"Missing trained trajectory head for joint evaluation: {trajectory_path}")
+        trajectory_head = load_trajectory_head(trajectory_path, map_location="cpu")
 
     scheduler = EulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
@@ -100,9 +126,10 @@ def _load_models(args, device: torch.device, dtype: torch.dtype):
         module.requires_grad_(False)
         module.to(device=device, dtype=dtype)
         module.eval()
-    trajectory_head.requires_grad_(False)
-    trajectory_head.to(device=device, dtype=torch.float32)
-    trajectory_head.eval()
+    if trajectory_head is not None:
+        trajectory_head.requires_grad_(False)
+        trajectory_head.to(device=device, dtype=torch.float32)
+        trajectory_head.eval()
     return feature_extractor, image_encoder, vae, unet, controlnet, trajectory_head, scheduler
 
 
@@ -128,14 +155,24 @@ def _make_loader(args):
 def _predict_batch(args, batch, models, device: torch.device, dtype: torch.dtype):
     feature_extractor, image_encoder, vae, unet, controlnet, trajectory_head, scheduler = models
     context_frames = batch["context_frames"].to(device=device, dtype=dtype)
-    context_coords_norm = batch["anchor_coords_norm"][:, : args.context_frames].to(device=device, dtype=torch.float32)
     batch_size = context_frames.shape[0]
 
     context_latents = tensor_to_vae_latent(context_frames, vae, sample=False)
-    image_tokens = encode_context_images(context_frames, feature_extractor, image_encoder, dtype)
-    trajectory_outputs = trajectory_head(image_tokens, context_coords_norm)
-    encoder_hidden_states = trajectory_outputs["encoder_hidden_states"].to(dtype=dtype)
-    pred_coords_norm = trajectory_outputs["pred_coords_norm"].clamp(0.0, 1.0)
+    image_tokens = encode_context_images(
+        context_frames,
+        feature_extractor,
+        image_encoder,
+        dtype,
+        return_frame_tokens=trajectory_head is not None,
+    )
+    if trajectory_head is None:
+        encoder_hidden_states = image_tokens.to(dtype=dtype)
+        pred_coords_norm = None
+    else:
+        context_coords_norm = batch["anchor_coords_norm"][:, : args.context_frames].to(device=device, dtype=torch.float32)
+        trajectory_outputs = trajectory_head(image_tokens, context_coords_norm)
+        encoder_hidden_states = trajectory_outputs["encoder_hidden_states"].to(dtype=dtype)
+        pred_coords_norm = trajectory_outputs["pred_coords_norm"].clamp(0.0, 1.0)
     latent_height, latent_width = context_latents.shape[-2:]
 
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -268,6 +305,7 @@ def main():
     args = parse_args()
     if args.context_frames != 5 or args.target_frames != 15:
         raise ValueError("This task is fixed to 5 context anchors and 15 target anchors.")
+    args.prediction_task = _resolve_prediction_task(args)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
@@ -281,8 +319,8 @@ def main():
     dataloader = _make_loader(args)
 
     horizons = {5: [], 10: [], 15: []}
-    trajectory_horizons_px = {5: [], 10: [], 15: []}
-    trajectory_horizons_norm = {5: [], 10: [], 15: []}
+    trajectory_horizons_px = {5: [], 10: [], 15: []} if args.prediction_task == "joint" else {}
+    trajectory_horizons_norm = {5: [], 10: [], 15: []} if args.prediction_task == "joint" else {}
     sample_artifacts = []
     prediction_rows = []
     clip_count = 0
@@ -292,14 +330,19 @@ def main():
         batch_size = predictions.shape[0]
         for batch_idx in range(batch_size):
             original_size = batch["original_size"][batch_idx]
-            target_coords_norm = batch["anchor_coords_norm"][
-                batch_idx, args.context_frames : args.context_frames + args.target_frames
-            ].float()
-            target_coords_px = batch["anchor_coords_px"][
-                batch_idx, args.context_frames : args.context_frames + args.target_frames
-            ].float()
-            pred_coords_norm_sample = pred_coords_norm[batch_idx].detach().cpu().float()
-            pred_coords_px = normalized_to_pixel_coords(pred_coords_norm_sample, tuple(original_size)).cpu()
+            target_coords_norm = None
+            target_coords_px = None
+            pred_coords_norm_sample = None
+            pred_coords_px = None
+            if pred_coords_norm is not None:
+                target_coords_norm = batch["anchor_coords_norm"][
+                    batch_idx, args.context_frames : args.context_frames + args.target_frames
+                ].float()
+                target_coords_px = batch["anchor_coords_px"][
+                    batch_idx, args.context_frames : args.context_frames + args.target_frames
+                ].float()
+                pred_coords_norm_sample = pred_coords_norm[batch_idx].detach().cpu().float()
+                pred_coords_px = normalized_to_pixel_coords(pred_coords_norm_sample, tuple(original_size)).cpu()
             frame_metrics = []
             pred_frames_for_sample = []
             for frame_idx in range(args.target_frames):
@@ -314,33 +357,42 @@ def main():
             for horizon in horizons:
                 subset = frame_metrics[:horizon]
                 horizons[horizon].append({metric: _mean([item[metric] for item in subset]) for metric in subset[0]})
-                trajectory_horizons_px[horizon].append(
-                    _trajectory_metrics(pred_coords_px[:horizon], target_coords_px[:horizon])
-                )
-                trajectory_horizons_norm[horizon].append(
-                    _trajectory_metrics(pred_coords_norm_sample[:horizon], target_coords_norm[:horizon])
-                )
+                if pred_coords_norm is not None:
+                    trajectory_horizons_px[horizon].append(
+                        _trajectory_metrics(pred_coords_px[:horizon], target_coords_px[:horizon])
+                    )
+                    trajectory_horizons_norm[horizon].append(
+                        _trajectory_metrics(pred_coords_norm_sample[:horizon], target_coords_norm[:horizon])
+                    )
 
             prediction_row = {
                 "patient_id": batch["patient_id"][batch_idx],
                 "source_video_id": batch["source_video_id"][batch_idx],
                 "trajectory_id": batch["trajectory_id"][batch_idx],
                 "original_size": list(original_size),
-                "pred_coords_norm": _coords_to_list(pred_coords_norm_sample),
-                "pred_coords_px": _coords_to_list(pred_coords_px),
-                "target_coords_norm": _coords_to_list(target_coords_norm),
-                "target_coords_px": _coords_to_list(target_coords_px),
             }
+            if pred_coords_norm is not None:
+                prediction_row.update(
+                    {
+                        "pred_coords_norm": _coords_to_list(pred_coords_norm_sample),
+                        "pred_coords_px": _coords_to_list(pred_coords_px),
+                        "target_coords_norm": _coords_to_list(target_coords_norm),
+                        "target_coords_px": _coords_to_list(target_coords_px),
+                    }
+                )
             prediction_rows.append(prediction_row)
 
             if clip_count < args.save_samples:
                 name = f"{batch['patient_id'][batch_idx]}_{batch['trajectory_id'][batch_idx]}"
                 gif_path = sample_dir / f"{clip_count:04d}_{name}.gif"
                 _save_gif(gif_path, pred_frames_for_sample, fps=7)
-                trajectory_path = sample_dir / f"{clip_count:04d}_{name}_trajectory.json"
-                with trajectory_path.open("w", encoding="utf-8") as handle:
-                    json.dump(prediction_row, handle, indent=2, sort_keys=True)
-                sample_artifacts.append({"gif": str(gif_path), "trajectory": str(trajectory_path)})
+                sample_artifact = {"gif": str(gif_path)}
+                if pred_coords_norm is not None:
+                    trajectory_path = sample_dir / f"{clip_count:04d}_{name}_trajectory.json"
+                    with trajectory_path.open("w", encoding="utf-8") as handle:
+                        json.dump(prediction_row, handle, indent=2, sort_keys=True)
+                    sample_artifact["trajectory"] = str(trajectory_path)
+                sample_artifacts.append(sample_artifact)
             clip_count += 1
 
     metrics = {}
@@ -351,36 +403,42 @@ def main():
         }
     trajectory_metrics_original_resolution = {}
     trajectory_metrics_normalized = {}
-    for horizon, rows in trajectory_horizons_px.items():
-        trajectory_metrics_original_resolution[f"horizon_{horizon}"] = {
-            "ade_px": _mean([row["ade"] for row in rows]),
-            "fde_px": _mean([row["fde"] for row in rows]),
-        }
-    for horizon, rows in trajectory_horizons_norm.items():
-        trajectory_metrics_normalized[f"horizon_{horizon}"] = {
-            "ade_norm": _mean([row["ade"] for row in rows]),
-            "fde_norm": _mean([row["fde"] for row in rows]),
-        }
+    if args.prediction_task == "joint":
+        for horizon, rows in trajectory_horizons_px.items():
+            trajectory_metrics_original_resolution[f"horizon_{horizon}"] = {
+                "ade_px": _mean([row["ade"] for row in rows]),
+                "fde_px": _mean([row["fde"] for row in rows]),
+            }
+        for horizon, rows in trajectory_horizons_norm.items():
+            trajectory_metrics_normalized[f"horizon_{horizon}"] = {
+                "ade_norm": _mean([row["ade"] for row in rows]),
+                "fde_norm": _mean([row["fde"] for row in rows]),
+            }
 
     report = {
         "dataset_name": "SurgWMBench",
-        "task": "20_anchor_first5_predict_6_to_20_joint_image_trajectory",
+        "task": f"20_anchor_first5_predict_6_to_20_{args.prediction_task}",
+        "prediction_task": args.prediction_task,
         "manifest": args.manifest,
         "checkpoint_dir": args.checkpoint_dir,
         "context_frames": args.context_frames,
         "target_frames": args.target_frames,
         "metrics_original_resolution": metrics,
-        "trajectory_metrics_original_resolution": trajectory_metrics_original_resolution,
-        "trajectory_metrics_normalized": trajectory_metrics_normalized,
         "num_clips": clip_count,
         "sample_artifacts": sample_artifacts,
     }
+    if args.prediction_task == "joint":
+        report["trajectory_metrics_original_resolution"] = trajectory_metrics_original_resolution
+        report["trajectory_metrics_normalized"] = trajectory_metrics_normalized
     with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
         for row in prediction_rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2, sort_keys=True)
-    print(json.dumps({"image": metrics, "trajectory": trajectory_metrics_original_resolution}, indent=2, sort_keys=True))
+    result = {"image": metrics}
+    if args.prediction_task == "joint":
+        result["trajectory"] = trajectory_metrics_original_resolution
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

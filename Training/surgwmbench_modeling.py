@@ -30,8 +30,19 @@ def decode_latents_to_frames(latents: torch.Tensor, vae, decode_chunk_size: int 
     return frames.float().add_(1.0).div_(2.0).clamp_(0.0, 1.0)
 
 
-def encode_context_images(context_frames: torch.Tensor, feature_extractor, image_encoder, dtype: torch.dtype) -> torch.Tensor:
-    """Encode context frames as a single mean-pooled CLIP token with shape [B, 1, D]."""
+def encode_context_images(
+    context_frames: torch.Tensor,
+    feature_extractor,
+    image_encoder,
+    dtype: torch.dtype,
+    return_frame_tokens: bool = False,
+) -> torch.Tensor:
+    """Encode context frames as CLIP tokens.
+
+    By default this returns one mean-pooled token with shape [B, 1, D]. Set
+    return_frame_tokens=True when downstream modules need one token per context
+    frame, returning [B, F, D].
+    """
     batch_size, context_count = context_frames.shape[:2]
     flat = rearrange(context_frames, "b f c h w -> (b f) c h w")
     flat = flat * 2.0 - 1.0
@@ -47,7 +58,10 @@ def encode_context_images(context_frames: torch.Tensor, feature_extractor, image
     ).pixel_values
     pixel_values = pixel_values.to(device=context_frames.device, dtype=dtype)
     embeds = image_encoder(pixel_values).image_embeds
-    return embeds.view(batch_size, context_count, -1).mean(dim=1, keepdim=True)
+    tokens = embeds.view(batch_size, context_count, -1)
+    if return_frame_tokens:
+        return tokens
+    return tokens.mean(dim=1, keepdim=True)
 
 
 def build_5frame_latent_input(

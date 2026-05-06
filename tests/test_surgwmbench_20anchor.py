@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch import nn
 
-from Training.surgwmbench_modeling import expand_conv_in_channels, resize_dual_control_fusion
+from Training.surgwmbench_modeling import encode_context_images, expand_conv_in_channels, resize_dual_control_fusion
 from Training.train_utils.surgwmbench_dataset import SurgWMBench20AnchorDataset
 from Training.trajectory_head import (
     TrajectoryPredictionHead,
@@ -88,6 +88,37 @@ def test_resize_dual_control_fusion_to_15_target_frames():
         assert block[0].out_channels == 14
         assert block[1].in_channels == 14
         assert block[1].out_channels == 14
+
+
+class FakeFeatureExtractor:
+    def __call__(self, images, **kwargs):
+        return SimpleNamespace(pixel_values=images)
+
+
+class FakeImageEncoder(nn.Module):
+    def forward(self, pixel_values):
+        batch = pixel_values.shape[0]
+        image_embeds = torch.arange(batch * 4, dtype=pixel_values.dtype, device=pixel_values.device).view(batch, 4)
+        return SimpleNamespace(image_embeds=image_embeds)
+
+
+def test_encode_context_images_can_pool_or_return_frame_tokens():
+    context_frames = torch.rand(2, 5, 3, 8, 8)
+    feature_extractor = FakeFeatureExtractor()
+    image_encoder = FakeImageEncoder()
+
+    frame_tokens = encode_context_images(
+        context_frames,
+        feature_extractor,
+        image_encoder,
+        torch.float32,
+        return_frame_tokens=True,
+    )
+    pooled_tokens = encode_context_images(context_frames, feature_extractor, image_encoder, torch.float32)
+
+    assert frame_tokens.shape == (2, 5, 4)
+    assert pooled_tokens.shape == (2, 1, 4)
+    assert torch.equal(pooled_tokens[:, 0], frame_tokens.mean(dim=1))
 
 
 def test_trajectory_prediction_head_shapes_and_range():

@@ -61,6 +61,12 @@ def parse_args():
     parser.add_argument("--noise-aug-strength", type=float, default=0.02)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-clips", type=int, default=None)
+    parser.add_argument(
+        "--prediction-task",
+        choices=["joint", "image-only"],
+        default="joint",
+        help="joint trains future images and trajectories; image-only trains future images without trajectory input or supervision.",
+    )
     parser.add_argument("--trajectory-loss-weight", type=float, default=10.0)
     parser.add_argument("--trajectory-velocity-loss-weight", type=float, default=1.0)
     parser.add_argument("--trajectory-hidden-dim", type=int, default=512)
@@ -122,15 +128,17 @@ def _prepare_models(args, accelerator: Accelerator, weight_dtype: torch.dtype):
     unet.to(accelerator.device, dtype=weight_dtype)
     unet.conv_in.to(dtype=torch.float32)
     controlnet.to(accelerator.device, dtype=torch.float32)
-    trajectory_head = TrajectoryPredictionHead(
-        image_embed_dim=infer_image_embed_dim(image_encoder),
-        hidden_dim=args.trajectory_hidden_dim,
-        context_frames=args.context_frames,
-        target_frames=args.target_frames,
-        num_layers=args.trajectory_num_layers,
-        num_heads=args.trajectory_num_heads,
-    )
-    trajectory_head.to(accelerator.device, dtype=torch.float32)
+    trajectory_head = None
+    if args.prediction_task == "joint":
+        trajectory_head = TrajectoryPredictionHead(
+            image_embed_dim=infer_image_embed_dim(image_encoder),
+            hidden_dim=args.trajectory_hidden_dim,
+            context_frames=args.context_frames,
+            target_frames=args.target_frames,
+            num_layers=args.trajectory_num_layers,
+            num_heads=args.trajectory_num_heads,
+        )
+        trajectory_head.to(accelerator.device, dtype=torch.float32)
     return feature_extractor, image_encoder, vae, unet, controlnet, trajectory_head
 
 
@@ -178,12 +186,17 @@ def main():
     feature_extractor, image_encoder, vae, unet, controlnet, trajectory_head = _prepare_models(args, accelerator, weight_dtype)
     train_dataloader = _make_dataloader(args)
 
-    trainable_params = list(controlnet.parameters()) + list(unet.conv_in.parameters()) + list(trajectory_head.parameters())
+    trainable_params = list(controlnet.parameters()) + list(unet.conv_in.parameters())
+    if trajectory_head is not None:
+        trainable_params += list(trajectory_head.parameters())
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
 
-    unet, controlnet, trajectory_head, optimizer, train_dataloader = accelerator.prepare(
-        unet, controlnet, trajectory_head, optimizer, train_dataloader
-    )
+    if trajectory_head is not None:
+        unet, controlnet, trajectory_head, optimizer, train_dataloader = accelerator.prepare(
+            unet, controlnet, trajectory_head, optimizer, train_dataloader
+        )
+    else:
+        unet, controlnet, optimizer, train_dataloader = accelerator.prepare(unet, controlnet, optimizer, train_dataloader)
 
     steps_per_epoch = len(train_dataloader)
     if args.max_train_steps is None:
@@ -193,25 +206,41 @@ def main():
     for epoch in range(args.num_train_epochs):
         controlnet.train()
         unet.train()
-        trajectory_head.train()
+        if trajectory_head is not None:
+            trajectory_head.train()
         for batch_idx, batch in enumerate(train_dataloader):
             if args.max_train_batches is not None and batch_idx >= args.max_train_batches:
                 break
-            with accelerator.accumulate(controlnet, trajectory_head):
+            if trajectory_head is None:
+                accumulate_context = accelerator.accumulate(controlnet)
+            else:
+                accumulate_context = accelerator.accumulate(controlnet, trajectory_head)
+            with accumulate_context:
                 context_frames = batch["context_frames"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
                 target_frames = batch["target_frames"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
-                anchor_coords_norm = batch["anchor_coords_norm"].to(accelerator.device, dtype=torch.float32, non_blocking=True)
-                context_coords_norm = anchor_coords_norm[:, : args.context_frames]
-                target_coords_norm = anchor_coords_norm[:, args.context_frames : args.context_frames + args.target_frames]
 
                 with torch.no_grad():
                     target_latents = tensor_to_vae_latent(target_frames, vae, sample=True)
                     context_latents = tensor_to_vae_latent(context_frames, vae, sample=False)
-                    image_tokens = encode_context_images(context_frames, feature_extractor, image_encoder, weight_dtype)
+                    image_tokens = encode_context_images(
+                        context_frames,
+                        feature_extractor,
+                        image_encoder,
+                        weight_dtype,
+                        return_frame_tokens=trajectory_head is not None,
+                    )
 
-                trajectory_outputs = trajectory_head(image_tokens, context_coords_norm)
-                encoder_hidden_states = trajectory_outputs["encoder_hidden_states"].to(dtype=weight_dtype)
-                pred_coords_norm = trajectory_outputs["pred_coords_norm"]
+                if trajectory_head is None:
+                    encoder_hidden_states = image_tokens.to(dtype=weight_dtype)
+                    pred_coords_norm = None
+                    target_coords_norm = None
+                else:
+                    anchor_coords_norm = batch["anchor_coords_norm"].to(accelerator.device, dtype=torch.float32, non_blocking=True)
+                    context_coords_norm = anchor_coords_norm[:, : args.context_frames]
+                    target_coords_norm = anchor_coords_norm[:, args.context_frames : args.context_frames + args.target_frames]
+                    trajectory_outputs = trajectory_head(image_tokens, context_coords_norm)
+                    encoder_hidden_states = trajectory_outputs["encoder_hidden_states"].to(dtype=weight_dtype)
+                    pred_coords_norm = trajectory_outputs["pred_coords_norm"]
 
                 noise = torch.randn_like(target_latents)
                 batch_size = target_latents.shape[0]
@@ -269,16 +298,19 @@ def main():
                     dim=1,
                 ).mean()
                 image_loss = loss
-                trajectory_loss = F.smooth_l1_loss(pred_coords_norm, target_coords_norm)
-                trajectory_velocity_loss = F.smooth_l1_loss(
-                    pred_coords_norm[:, 1:] - pred_coords_norm[:, :-1],
-                    target_coords_norm[:, 1:] - target_coords_norm[:, :-1],
-                )
-                loss = (
-                    image_loss
-                    + args.trajectory_loss_weight * trajectory_loss
-                    + args.trajectory_velocity_loss_weight * trajectory_velocity_loss
-                )
+                trajectory_loss = None
+                trajectory_velocity_loss = None
+                if trajectory_head is not None:
+                    trajectory_loss = F.smooth_l1_loss(pred_coords_norm, target_coords_norm)
+                    trajectory_velocity_loss = F.smooth_l1_loss(
+                        pred_coords_norm[:, 1:] - pred_coords_norm[:, :-1],
+                        target_coords_norm[:, 1:] - target_coords_norm[:, :-1],
+                    )
+                    loss = (
+                        image_loss
+                        + args.trajectory_loss_weight * trajectory_loss
+                        + args.trajectory_velocity_loss_weight * trajectory_velocity_loss
+                    )
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -289,15 +321,24 @@ def main():
             if accelerator.sync_gradients:
                 global_step += 1
                 if accelerator.is_main_process:
-                    logger.info(
-                        "epoch=%s step=%s loss=%.6f image_loss=%.6f traj_loss=%.6f traj_vel_loss=%.6f",
-                        epoch,
-                        global_step,
-                        loss.detach().item(),
-                        image_loss.detach().item(),
-                        trajectory_loss.detach().item(),
-                        trajectory_velocity_loss.detach().item(),
-                    )
+                    if trajectory_head is None:
+                        logger.info(
+                            "epoch=%s step=%s task=image-only loss=%.6f image_loss=%.6f",
+                            epoch,
+                            global_step,
+                            loss.detach().item(),
+                            image_loss.detach().item(),
+                        )
+                    else:
+                        logger.info(
+                            "epoch=%s step=%s task=joint loss=%.6f image_loss=%.6f traj_loss=%.6f traj_vel_loss=%.6f",
+                            epoch,
+                            global_step,
+                            loss.detach().item(),
+                            image_loss.detach().item(),
+                            trajectory_loss.detach().item(),
+                            trajectory_velocity_loss.detach().item(),
+                        )
                 if global_step % args.checkpointing_steps == 0:
                     accelerator.save_state(str(output_dir / f"checkpoint-{global_step}"))
                 if global_step >= args.max_train_steps:
@@ -309,10 +350,11 @@ def main():
     if accelerator.is_main_process:
         unwrapped_unet = accelerator.unwrap_model(unet)
         unwrapped_controlnet = accelerator.unwrap_model(controlnet)
-        unwrapped_trajectory_head = accelerator.unwrap_model(trajectory_head)
         unwrapped_unet.save_pretrained(output_dir / "unet_context")
         unwrapped_controlnet.save_pretrained(output_dir / "controlnet")
-        save_trajectory_head(unwrapped_trajectory_head, output_dir / "trajectory_head.pt")
+        if trajectory_head is not None:
+            unwrapped_trajectory_head = accelerator.unwrap_model(trajectory_head)
+            save_trajectory_head(unwrapped_trajectory_head, output_dir / "trajectory_head.pt")
         logger.info("Saved SurgWMBench 20-anchor checkpoint to %s", output_dir)
 
 

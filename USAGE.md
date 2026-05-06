@@ -7,6 +7,10 @@ observed trajectory points, and the output is the future 15 anchor frames plus
 the future 15 trajectory points. Evaluation reports horizons 5, 10, and 15
 against original-size frames and original-resolution trajectory pixels.
 
+Use `--prediction-task image-only` to train or evaluate a strict image-only
+variant: the model uses only the first 5 anchor frames as input, predicts future
+frames 6-20, and does not build, save, or load `trajectory_head.pt`.
+
 ## Environment
 
 Create the Python 3.11 environment from the locked uv project:
@@ -47,7 +51,14 @@ The default pretrained checkpoint path is:
 ./Training/ckpts/stable-video-diffusion-img2vid-xt-1-1
 ```
 
-Training writes a joint checkpoint with:
+## Joint Image + Trajectory Workflow
+
+Use this mode when the input is the first 5 anchor frames plus their first 5
+trajectory points, and the model should predict both future frames and future
+trajectory points for anchors 6-20. This is the default `--prediction-task
+joint` mode.
+
+Joint training writes:
 
 ```text
 unet_context/
@@ -56,9 +67,7 @@ trajectory_head.pt
 training_args.json
 ```
 
-## Single-GPU Training
-
-Run one GPU with the direct Python entrypoint:
+### Single-GPU Joint Training
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run --frozen python Training/train_surgwmbench_20anchor.py \
@@ -68,16 +77,15 @@ CUDA_VISIBLE_DEVICES=0 uv run --frozen python Training/train_surgwmbench_20ancho
   --output-dir ./Training/logs/surgwmbench_20anchor \
   --per-gpu-batch-size 1 \
   --gradient-accumulation-steps 1 \
-  --mixed-precision fp16
+  --mixed-precision fp16 \
+  --trajectory-loss-weight 10.0 \
+  --trajectory-velocity-loss-weight 1.0 \
+  --trajectory-hidden-dim 512 \
+  --trajectory-num-layers 2 \
+  --trajectory-num-heads 8
 ```
 
-For a small real-data smoke run, add:
-
-```bash
---max-clips 1 --max-train-batches 1 --num-train-epochs 1
-```
-
-## Multi-GPU Training
+### Multi-GPU Joint Training
 
 Run DDP through Accelerate. Set `--num_processes` to the number of visible GPUs:
 
@@ -90,19 +98,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run --frozen python -m accelerate.commands.launc
   --output-dir ./Training/logs/surgwmbench_20anchor \
   --per-gpu-batch-size 1 \
   --gradient-accumulation-steps 1 \
-  --mixed-precision fp16
+  --mixed-precision fp16 \
+  --trajectory-loss-weight 10.0 \
+  --trajectory-velocity-loss-weight 1.0 \
+  --trajectory-hidden-dim 512 \
+  --trajectory-num-layers 2 \
+  --trajectory-num-heads 8
 ```
 
-Effective batch size is:
+### Joint Evaluation
 
-```text
-per-gpu-batch-size * num_processes * gradient-accumulation-steps
-```
-
-## Evaluation
-
-Evaluate one checkpoint and report original-resolution metrics for horizons
-5, 10, and 15. The report includes image metrics and trajectory ADE/FDE:
+Evaluate original-resolution image metrics plus trajectory ADE/FDE for horizons
+5, 10, and 15:
 
 ```bash
 uv run --frozen python Training/eval_surgwmbench_20anchor.py \
@@ -111,7 +118,82 @@ uv run --frozen python Training/eval_surgwmbench_20anchor.py \
   --pretrained-model-name-or-path ./Training/ckpts/stable-video-diffusion-img2vid-xt-1-1 \
   --checkpoint-dir ./Training/logs/surgwmbench_20anchor \
   --output-dir ./Training/eval/surgwmbench_20anchor \
+  --prediction-task joint \
   --batch-size 1
+```
+
+## Image-Only Workflow
+
+Use this mode when the input is only the first 5 anchor frames and the model
+should predict future frames 6-20. It does not use trajectory points as inputs
+or labels, and does not build, save, or load `trajectory_head.pt`.
+
+Image-only training writes:
+
+```text
+unet_context/
+controlnet/
+training_args.json
+```
+
+### Single-GPU Image-Only Training
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --frozen python Training/train_surgwmbench_20anchor.py \
+  --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
+  --train-manifest manifests/train.jsonl \
+  --pretrained-model-name-or-path ./Training/ckpts/stable-video-diffusion-img2vid-xt-1-1 \
+  --output-dir ./Training/logs/surgwmbench_20anchor_image_only \
+  --per-gpu-batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --mixed-precision fp16 \
+  --prediction-task image-only
+```
+
+### Multi-GPU Image-Only Training
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run --frozen python -m accelerate.commands.launch --num_processes 4 \
+  Training/train_surgwmbench_20anchor.py \
+  --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
+  --train-manifest manifests/train.jsonl \
+  --pretrained-model-name-or-path ./Training/ckpts/stable-video-diffusion-img2vid-xt-1-1 \
+  --output-dir ./Training/logs/surgwmbench_20anchor_image_only \
+  --per-gpu-batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --mixed-precision fp16 \
+  --prediction-task image-only
+```
+
+### Image-Only Evaluation
+
+Evaluate original-resolution image metrics only. Evaluation can auto-detect the
+mode from `training_args.json`, but passing `--prediction-task image-only` keeps
+the command explicit:
+
+```bash
+uv run --frozen python Training/eval_surgwmbench_20anchor.py \
+  --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
+  --manifest manifests/val.jsonl \
+  --pretrained-model-name-or-path ./Training/ckpts/stable-video-diffusion-img2vid-xt-1-1 \
+  --checkpoint-dir ./Training/logs/surgwmbench_20anchor_image_only \
+  --output-dir ./Training/eval/surgwmbench_20anchor_image_only \
+  --prediction-task image-only \
+  --batch-size 1
+```
+
+## Training Notes
+
+For a small real-data smoke run, add these flags to either training command:
+
+```bash
+--max-clips 1 --max-train-batches 1 --num-train-epochs 1
+```
+
+Effective batch size for either workflow is:
+
+```text
+per-gpu-batch-size * num_processes * gradient-accumulation-steps
 ```
 
 Add `--compute-lpips` only after syncing with `uv sync --extra metrics`.
