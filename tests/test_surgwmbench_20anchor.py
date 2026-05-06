@@ -5,7 +5,12 @@ import pytest
 import torch
 from torch import nn
 
-from Training.surgwmbench_modeling import encode_context_images, expand_conv_in_channels, resize_dual_control_fusion
+from Training.surgwmbench_modeling import (
+    augment_context_trajectory_coords,
+    encode_context_images,
+    expand_conv_in_channels,
+    resize_dual_control_fusion,
+)
 from Training.train_utils.surgwmbench_dataset import SurgWMBench20AnchorDataset
 from Training.trajectory_head import (
     TrajectoryPredictionHead,
@@ -119,6 +124,27 @@ def test_encode_context_images_can_pool_or_return_frame_tokens():
     assert frame_tokens.shape == (2, 5, 4)
     assert pooled_tokens.shape == (2, 1, 4)
     assert torch.equal(pooled_tokens[:, 0], frame_tokens.mean(dim=1))
+
+
+def test_augment_context_trajectory_coords_masks_inputs_without_changing_source():
+    coords = torch.full((2, 5, 2), 0.5)
+
+    augmented = augment_context_trajectory_coords(coords, mask_prob=1.0, mask_value=-1.0)
+
+    assert torch.equal(coords, torch.full((2, 5, 2), 0.5))
+    assert torch.equal(augmented, torch.full((2, 5, 2), -1.0))
+
+
+def test_augment_context_trajectory_coords_adds_clamped_noise():
+    torch.manual_seed(0)
+    coords = torch.full((4, 5, 2), 0.5)
+
+    augmented = augment_context_trajectory_coords(coords, noise_std=0.5)
+
+    assert augmented.shape == coords.shape
+    assert not torch.equal(augmented, coords)
+    assert torch.all(augmented >= 0.0)
+    assert torch.all(augmented <= 1.0)
 
 
 def test_trajectory_prediction_head_shapes_and_range():

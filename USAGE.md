@@ -58,6 +58,12 @@ trajectory points, and the model should predict both future frames and future
 trajectory points for anchors 6-20. This is the default `--prediction-task
 joint` mode.
 
+Joint training applies robustness augmentation to the observed input trajectory
+points by default: Gaussian noise in normalized coordinate space and random
+per-point masking. Future trajectory labels remain clean. Set
+`--trajectory-input-noise-std 0.0 --trajectory-input-mask-prob 0.0` to disable
+this augmentation.
+
 Joint training writes:
 
 ```text
@@ -80,6 +86,9 @@ CUDA_VISIBLE_DEVICES=0 uv run --frozen python Training/train_surgwmbench_20ancho
   --mixed-precision fp16 \
   --trajectory-loss-weight 10.0 \
   --trajectory-velocity-loss-weight 1.0 \
+  --trajectory-input-noise-std 0.01 \
+  --trajectory-input-mask-prob 0.2 \
+  --trajectory-input-mask-value -1.0 \
   --trajectory-hidden-dim 512 \
   --trajectory-num-layers 2 \
   --trajectory-num-heads 8
@@ -101,6 +110,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run --frozen python -m accelerate.commands.launc
   --mixed-precision fp16 \
   --trajectory-loss-weight 10.0 \
   --trajectory-velocity-loss-weight 1.0 \
+  --trajectory-input-noise-std 0.01 \
+  --trajectory-input-mask-prob 0.2 \
+  --trajectory-input-mask-value -1.0 \
   --trajectory-hidden-dim 512 \
   --trajectory-num-layers 2 \
   --trajectory-num-heads 8

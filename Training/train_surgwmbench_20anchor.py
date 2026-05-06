@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from Training.surgwmbench_modeling import (
+    augment_context_trajectory_coords,
     build_5frame_latent_input,
     encode_context_images,
     expand_conv_in_channels,
@@ -69,6 +70,24 @@ def parse_args():
     )
     parser.add_argument("--trajectory-loss-weight", type=float, default=10.0)
     parser.add_argument("--trajectory-velocity-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--trajectory-input-noise-std",
+        type=float,
+        default=0.01,
+        help="Gaussian noise std for observed normalized trajectory points in joint training.",
+    )
+    parser.add_argument(
+        "--trajectory-input-mask-prob",
+        type=float,
+        default=0.2,
+        help="Per-point probability of masking observed trajectory inputs in joint training.",
+    )
+    parser.add_argument(
+        "--trajectory-input-mask-value",
+        type=float,
+        default=-1.0,
+        help="Sentinel value used for masked observed trajectory inputs.",
+    )
     parser.add_argument("--trajectory-hidden-dim", type=int, default=512)
     parser.add_argument("--trajectory-num-layers", type=int, default=2)
     parser.add_argument("--trajectory-num-heads", type=int, default=8)
@@ -165,6 +184,10 @@ def main():
     args = parse_args()
     if args.context_frames != 5 or args.target_frames != 15:
         raise ValueError("This task is fixed to 5 context anchors and 15 target anchors.")
+    if args.trajectory_input_noise_std < 0:
+        raise ValueError("--trajectory-input-noise-std must be non-negative.")
+    if args.trajectory_input_mask_prob < 0 or args.trajectory_input_mask_prob > 1:
+        raise ValueError("--trajectory-input-mask-prob must be in [0, 1].")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     set_seed(args.seed)
@@ -238,6 +261,12 @@ def main():
                     anchor_coords_norm = batch["anchor_coords_norm"].to(accelerator.device, dtype=torch.float32, non_blocking=True)
                     context_coords_norm = anchor_coords_norm[:, : args.context_frames]
                     target_coords_norm = anchor_coords_norm[:, args.context_frames : args.context_frames + args.target_frames]
+                    context_coords_norm = augment_context_trajectory_coords(
+                        context_coords_norm,
+                        noise_std=args.trajectory_input_noise_std,
+                        mask_prob=args.trajectory_input_mask_prob,
+                        mask_value=args.trajectory_input_mask_value,
+                    )
                     trajectory_outputs = trajectory_head(image_tokens, context_coords_norm)
                     encoder_hidden_states = trajectory_outputs["encoder_hidden_states"].to(dtype=weight_dtype)
                     pred_coords_norm = trajectory_outputs["pred_coords_norm"]

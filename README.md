@@ -92,6 +92,8 @@ python Training/eval_surgwmbench_20anchor.py \
 The model input excludes future anchor coordinates. `sampled_indices` are used
 only to select the 20 human-anchor frames from each dense clip, and future
 trajectory points are used only as training and evaluation labels.
+Joint training adds robustness augmentation to the observed input trajectory
+points with Gaussian noise and random per-point masking.
 
 Pass `--prediction-task image-only` to train or evaluate the image-only variant
 without trajectory inputs, trajectory supervision, or `trajectory_head.pt`.

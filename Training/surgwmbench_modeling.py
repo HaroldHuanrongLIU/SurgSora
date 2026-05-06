@@ -64,6 +64,29 @@ def encode_context_images(
     return tokens.mean(dim=1, keepdim=True)
 
 
+def augment_context_trajectory_coords(
+    context_coords_norm: torch.Tensor,
+    noise_std: float = 0.0,
+    mask_prob: float = 0.0,
+    mask_value: float = -1.0,
+) -> torch.Tensor:
+    """Add training-time robustness noise to observed normalized trajectory points."""
+    if noise_std < 0:
+        raise ValueError(f"noise_std must be non-negative, got {noise_std}")
+    if mask_prob < 0 or mask_prob > 1:
+        raise ValueError(f"mask_prob must be in [0, 1], got {mask_prob}")
+    if noise_std == 0 and mask_prob == 0:
+        return context_coords_norm
+
+    augmented = context_coords_norm.clone()
+    if noise_std > 0:
+        augmented = (augmented + torch.randn_like(augmented) * noise_std).clamp(0.0, 1.0)
+    if mask_prob > 0:
+        mask = torch.rand(augmented.shape[:-1], device=augmented.device) < mask_prob
+        augmented = augmented.masked_fill(mask.unsqueeze(-1), mask_value)
+    return augmented
+
+
 def build_5frame_latent_input(
     noisy_target_latents: torch.Tensor,
     context_latents: torch.Tensor,
