@@ -64,6 +64,19 @@ per-point masking. Future trajectory labels remain clean. Set
 `--trajectory-input-noise-std 0.0 --trajectory-input-mask-prob 0.0` to disable
 this augmentation.
 
+To keep random masking but disable Gaussian noise, use:
+
+```bash
+--trajectory-input-noise-std 0.0
+```
+
+To disable both Gaussian noise and random masking, use:
+
+```bash
+--trajectory-input-noise-std 0.0 \
+--trajectory-input-mask-prob 0.0
+```
+
 Joint training writes:
 
 ```text
