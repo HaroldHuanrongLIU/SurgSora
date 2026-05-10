@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from Training.surgwmbench_modeling import (
+    augment_context_trajectory_coords,
     build_5frame_latent_input,
     decode_latents_to_frames,
     encode_context_images,
@@ -59,6 +60,11 @@ def parse_args():
         default="auto",
         help="Evaluation mode. auto reads training_args.json or infers from trajectory_head.pt.",
     )
+    parser.add_argument("--trajectory-input-noise-std", type=float, default=0.0,
+                        help="Gaussian noise std applied to observed trajectory coords at inference (joint mode).")
+    parser.add_argument("--trajectory-input-mask-prob", type=float, default=0.0,
+                        help="Per-point masking probability for observed trajectory coords at inference (joint mode).")
+    parser.add_argument("--trajectory-input-mask-value", type=float, default=-1.0)
     return parser.parse_args()
 
 
@@ -170,6 +176,13 @@ def _predict_batch(args, batch, models, device: torch.device, dtype: torch.dtype
         pred_coords_norm = None
     else:
         context_coords_norm = batch["anchor_coords_norm"][:, : args.context_frames].to(device=device, dtype=torch.float32)
+        if args.trajectory_input_noise_std > 0 or args.trajectory_input_mask_prob > 0:
+            context_coords_norm = augment_context_trajectory_coords(
+                context_coords_norm,
+                noise_std=args.trajectory_input_noise_std,
+                mask_prob=args.trajectory_input_mask_prob,
+                mask_value=args.trajectory_input_mask_value,
+            )
         trajectory_outputs = trajectory_head(image_tokens, context_coords_norm)
         encoder_hidden_states = trajectory_outputs["encoder_hidden_states"].to(dtype=dtype)
         pred_coords_norm = trajectory_outputs["pred_coords_norm"].clamp(0.0, 1.0)

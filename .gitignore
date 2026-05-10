@@ -7,4 +7,5 @@ __pycache__/
 outputs/
 Training/logs/
 Training/ckpts/
+Training/eval_outputs/
 models/**/checkpoints/

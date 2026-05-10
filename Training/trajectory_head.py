@@ -90,7 +90,8 @@ class TrajectoryPredictionHead(nn.Module):
         memory = self.context_encoder(memory)
 
         coord_condition_tokens = self.condition_proj(memory[:, self.context_frames :])
-        encoder_hidden_states = torch.cat([image_tokens.float(), coord_condition_tokens], dim=1)
+        all_tokens = torch.cat([image_tokens.float(), coord_condition_tokens], dim=1)
+        encoder_hidden_states = all_tokens.mean(dim=1, keepdim=True)
 
         queries = self.future_queries.unsqueeze(0).expand(batch_size, -1, -1)
         decoded = self.future_decoder(queries, memory)
